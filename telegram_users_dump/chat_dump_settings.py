@@ -21,8 +21,10 @@ class ChatDumpSettings:
 
         parser.add_argument('-c', '--chat', required=True, type=str)
         parser.add_argument('-p', '--phone', required=True, type=str)
-        parser.add_argument('-f', '--filter', default="*", required=False, type=str)
-        parser.add_argument('-o', '--out', default='', type=str)
+        parser.add_argument('-f', '--filter', default=".*", required=False, type=str)
+        parser.add_argument('-i', '--ignore_case', required=False, action='store_true')
+        parser.add_argument('-o', '--out', default='', required=False, type=str)
+        parser.add_argument('-e', '--exp', default='', type=str)
 
         args = parser.parse_args()
 
@@ -39,6 +41,11 @@ class ChatDumpSettings:
         except ValueError:
             parser.error('Phone number is invalid.')
 
+        # Validate exporter name / set default
+        exp_file = 'csv' if not args.exp else args.exp
+        if not exp_file:
+            parser.error('Exporter name is invalid.')
+
         # Default output file if not specified by user
         OUTPUT_FILE_TEMPLATE = 'telegram_{}.log'
         if args.out != '':
@@ -52,6 +59,8 @@ class ChatDumpSettings:
         self.phone_num = args.phone
         self.out_file = out_file
         self.filter = args.filter
+        self.ignore_case = args.ignore_case
+        self.exporter = exp_file
 
 
 class CustomFormatter(argparse.HelpFormatter):

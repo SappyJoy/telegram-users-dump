@@ -14,3 +14,18 @@ def sprint(string, *args, **kwargs):
 
 
 JOIN_CHAT_PREFIX_URL = 'https://t.me/joinchat/'
+
+# Underlines if object is None
+def uin(obj, medium_length=5):
+    return str(obj) if obj else "_" * medium_length
+
+# Empty string if object is None
+def ein(obj):
+    return str(obj) if obj else ""
+
+def quoted_if_has_comma(obj):
+    if not obj:
+        return ""
+    if str(obj).find(",") != -1:
+        return '"' + str(obj) + '"'
+    return str(obj)

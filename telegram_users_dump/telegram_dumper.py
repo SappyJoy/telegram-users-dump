@@ -7,13 +7,14 @@
 import os
 import sys
 import logging
+import re
+from joblib import Parallel, delayed
+from time import sleep
 from collections import deque
-import tempfile
 from telethon.tl.types import ChannelParticipantsSearch
 from telegram_users_dump.exceptions import DumpingError
 from telegram_users_dump.utils import sprint
 from getpass import getpass
-from time import sleep
 import codecs
 from telethon import TelegramClient, sync # pylint: disable=unused-import
 from telethon.errors import (FloodWaitError,
@@ -22,13 +23,15 @@ from telethon.errors import (FloodWaitError,
                              UsernameInvalidError)
 from telethon import functions, types
 from telethon.tl.functions.contacts import ResolveUsernameRequest
-from telegram_users_dump.utils import JOIN_CHAT_PREFIX_URL
+from telegram_users_dump.utils import JOIN_CHAT_PREFIX_URL, ein
+from telegram_users_dump.exporter_context import ExporterContext
+from telegram_users_dump.progress_bar import ProgressBar
 
 
 class TelegramDumper(TelegramClient):
     """ Authenticates and opens new session. Retrieves message history for a chat. """
 
-    def __init__(self, session_user_id, settings):
+    def __init__(self, session_user_id, settings, exporter):
         self.logger = logging.getLogger(__name__)
         self.logger.info('Initializing session...')
         super().__init__(session_user_id, settings.api_id, settings.api_hash, timeout=40, proxy=None)
@@ -38,6 +41,12 @@ class TelegramDumper(TelegramClient):
         
         # A list of paths to the temp files
         self.temp_files_list = deque()
+
+        # Exporter object that converts msg -> string
+        self.exporter = exporter
+
+        # The context that will be passed to the exporter
+        self.exporter_context = ExporterContext()
 
         # The number of messages written into a resulting file de-facto
         self.output_total_count = 0
@@ -56,27 +65,8 @@ class TelegramDumper(TelegramClient):
                                   exc_info=self.logger.level > logging.INFO)
                 return
             # Fetch history in chunks and save it into a resulting file
-            # self._do_dump(chatObj)
-            offset = 0
-            limit = 100
-            all_participants = []
-            # while True:
-                # self.get_participants
-                # participants = functions.channels.GetParticipantsRequest(channel, ChannelParticipantsSearch(''), offset, limit, hash=0)
-                # participants = functions.channels.GetParticipantsRequest(channel, ChannelParticipantsSearch(''), offset, limit, hash=0)
-                # if not participants.users:
-                #     break
-                # all_participants.extend(participants.users)
-                # offset += len(participants.users)
-                # print(participants)
-
-            # Сделать так, чтобы на каждые 1000 пользователей созавался tempfile, а в конце вся информация мёржилась
-            participants = self.get_participants(channel)
-            i = 0
-            for user in participants:
-                full = self(functions.users.GetFullUserRequest(user))
-                print(str(full.user.first_name) + ": " + str(full.about))
-
+            self._do_dump(channel)
+            
         except DumpingError as ex:
             self.logger.error('%s', ex, exc_info=self.logger.level > logging.INFO)
             ret_code = 1
@@ -94,7 +84,7 @@ class TelegramDumper(TelegramClient):
                 except Exception:  # pylint: disable=broad-except
                     pass
 
-        sprint('{} messages were successfully written in the resulting file. Done!'
+        sprint('{} users were successfully written in the resulting file. Done!'
                .format(self.output_total_count))
         return ret_code
 
@@ -102,7 +92,8 @@ class TelegramDumper(TelegramClient):
         """ Connect to the Telegram server and Authenticate. """
         sprint('Connecting to Telegram servers...')
         if not self.connect():
-            sprint('Initial connection failed.')
+            # sprint('Initial connection failed.')
+            pass
 
         # Then, ensure we're authorized and have access
         if not self.is_user_authorized():
@@ -185,23 +176,15 @@ class TelegramDumper(TelegramClient):
 
         raise ValueError('Failed to resolve dialogue/chat name "{}".'.format(name))
 
-
-    def _do_dump(self, peer):
-        """ Retrieves messages in small chunks (Default: 100) and saves them in in-memory 'buffer'.
-            When buffer reaches '1000' messages they are saved into intermediate temp file.
-            In the end messages from all the temp files are being moved into resulting file in
-            ascending order along with the remaining ones in 'buffer'.
-            After all, temp files are deleted.
+    def _do_dump(self, channel):
+        """ Retrieves users and save them in-memory 'buffer'.
+            Then writes them in resulting file.
 
              :param peer: Chat/Channel object that contains the message history of interest
 
              :return  Number of files that were saved into resulting file
         """
-        self.msg_count_to_process = self.settings.limit \
-            if self.settings.limit != -1\
-            and not self.settings.limit == 0\
-            and not self.settings.is_incremental_mode\
-            else sys.maxsize
+        self.msg_count_to_process = sys.maxsize
 
         self._check_preconditions()
 
@@ -209,102 +192,82 @@ class TelegramDumper(TelegramClient):
         # or otherwise written directly into the resulting file if there are too few of them
         # to form a batch of size 1000.
         buffer = deque()
+        filter_flags = re.IGNORECASE if self.settings.ignore_case else 0
+        pattern = re.compile(self.settings.filter, filter_flags)
 
-        # Delete old metafile in Continue mode
-        if not self.settings.is_incremental_mode:
-            self.metadata.delete_meta_file()
-
-        temp_files_list_meta = deque()  # a list of meta info about batches
-
-        # process messages until either all message count requested by user are retrieved
-        # or offset_id reaches msg_id=1 - the head of a channel message history
+        # process users
         try:
-            while self.msg_count_to_process > 0:
-                # slip for a few seconds to avoid flood ban
-                sleep(2)
+            all_participants = self.get_participants(channel, filter=ChannelParticipantsSearch(''), aggressive=True)
+            users_size = len(all_participants)
+            sprint("Found users total: {}".format(users_size))
 
-                latest_message_id_fetched = self._fetch_messages_from_server(
-                    peer, buffer)
-
-                # This is for the case when buffer with fewer than 1000 records
-                # Relies on the fact that `_fetch_messages_from_server` returns messages
-                # in reverse order
-                if self.cur_latest_message_id < latest_message_id_fetched:
-                    self.cur_latest_message_id = latest_message_id_fetched
-                # when buffer is full, flush it into a temp file
-                # Assume that once a message got into temp file it will be counted as successful
-                # 'output_total_count'. This has to be improved.
-                if len(buffer) >= 1000:
-                    self._flush_buffer_in_temp_file(buffer)
-                    temp_files_list_meta.append(latest_message_id_fetched)
-
-                # break if the very beginning of channel history is reached
-                if latest_message_id_fetched == -1 or self.id_offset <= 1:
-                    break
+            users_count = 0
+            found = 0
+            bar = ProgressBar("Processed users", users_size)
+            bar.startProgress()
+            for user in all_participants:
+                full = self(functions.users.GetFullUserRequest(user))
+                if pattern.search(ein(full.about)):
+                    user_dump_str = self.exporter.format(full, self.exporter_context)
+                    buffer.append(user_dump_str)
+                    found += 1
+                users_count += 1
+                bar.progress(users_count, found)
+            bar.endProgress(found)
         except RuntimeError as ex:
-            sprint('Fetching messages from server failed. ' + str(ex))
+            sprint('Fetching users from server failed. ' + str(ex))
             sprint('Warn: The resulting file will contain partial/incomplete data.')
 
-
-        # Write all chunks into resulting file
-        sprint('Merging results into an output file.')
+        sprint('Writing results into an output file.')
         try:
-            self._write_final_file(buffer, temp_files_list_meta)
+            self._write_final_file(buffer)
         except OSError as ex:
             raise DumpingError("Dumping to a final file failed.") from ex
 
-        # Metadata that will be written into a metafile
-        meta_dict = {
-            "latest_message_id": self.cur_latest_message_id,
-            "exporter_name": self.settings.exporter,
-            "chat_name": self.settings.chat_name
-        }
-        self.metadata.save_meta_file(meta_dict)
-
-    def _flush_buffer_in_temp_file(self, buffer):
-        """ Flush buffer into a new temp file """
-        with tempfile \
-                .NamedTemporaryFile(mode='w+', encoding='utf-8', delete=False) as tf:
-            self.output_total_count += self._flush_buffer_into_filestream(buffer, tf)
-            self.temp_files_list.append(tf)
+    def _check_preconditions(self):
+        """ Check preconditions before processing data """
+        out_file_path = self.settings.out_file
+        if os.path.exists(out_file_path):
+            sprint('Warning: The output file already exists.')
+            if not self._is_user_confirmed('Are you sure you want to overwrite it? [y/n]'):
+                raise DumpingError("Terminating on user's request...")
+        # Check if output file can be created/overwritten
+        try:
+            with open(out_file_path, mode='w+'):
+                pass
+        except OSError as ex:
+            raise DumpingError('Output file path "{}" is invalid. {}'.format(
+                out_file_path, ex.strerror))
+        sprint('Dumping {} users into "{}" file ...'
+                .format('all' if self.msg_count_to_process == sys.maxsize
+                        else self.msg_count_to_process, out_file_path))
 
     def _flush_buffer_into_filestream(self, buffer, file_stream):
         """ Flush buffer into a file stream """
         count = 0
         while buffer:
             count += 1
-            cur_message = buffer.pop()
-            print(cur_message, file=file_stream)
+            cur_user = buffer.pop()
+            print(cur_user, file=file_stream)
         return count
 
-    def _write_final_file(self, buffer, temp_files_list_meta):
-        result_file_mode = 'a' if self.settings.last_message_id > -1 else 'w'
-        with codecs.open(self.settings.out_file, result_file_mode, 'utf-8') as resulting_file:
-            if self.settings.is_addbom:
-                resulting_file.write(codecs.BOM_UTF8.decode())
+    def _write_final_file(self, buffer):
+        # result_file_mode = 'a' if self.settings.last_message_id > -1 else 'w'
+        with codecs.open(self.settings.out_file, 'w', 'utf-8') as resulting_file:
+            # if self.settings.is_addbom:
+            #     resulting_file.write(codecs.BOM_UTF8.decode())
 
-            self.exporter.begin_final_file(
-                resulting_file, self.exporter_context)
+            # self.exporter.begin_final_file(
+            #     resulting_file, self.exporter_context)
 
             # flush what's left in the mem buffer into resulting file
             self.output_total_count += self._flush_buffer_into_filestream(
                 buffer, resulting_file)
 
-            self._merge_temp_files_into_final(
-                resulting_file, temp_files_list_meta)
-
-    def _merge_temp_files_into_final(self, resulting_file, temp_files_list_meta):
-        """ merge all temp files into final one and delete them """
-        while self.temp_files_list:
-            tf = self.temp_files_list.pop()
-            with codecs.open(tf.name, 'r', 'utf-8') as ctf:
-                for line in ctf.readlines():
-                    print(line, file=resulting_file, end='')
-            # delete temp file
-            self.logger.debug("Delete temp file %s", tf.name)
-            tf.close()
-            os.remove(tf.name)
-            # update the latest_message_id metadata
-            batch_latest_message_id = temp_files_list_meta.pop()
-            if batch_latest_message_id > self.cur_latest_message_id:
-                self.cur_latest_message_id = batch_latest_message_id
+    def _is_user_confirmed(self, msg):
+        """ Get confirmation from user """
+        # if self.settings.is_quiet_mode:
+        #     return True
+        continueResponse = input(msg).lower().strip()
+        return continueResponse == 'y'\
+            or continueResponse == 'yes'

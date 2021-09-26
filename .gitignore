@@ -59,3 +59,4 @@ target/
 # Session temp files from Telethon
 **/*.session
 **/*.log
+**/*.csv
