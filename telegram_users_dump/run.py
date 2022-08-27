@@ -11,7 +11,7 @@ Where:
     -f,  --filter       Filter using regular expression
     -i,  --ignore_case  Ignore case while filtering
     -o,  --out          Output file name or full path. (Default: telegram_<chatName>.log)
-    -e,  --exp          Exporter name. text | jsonl | csv (Default: 'text')
+    -e,  --exp          Exporter name. text | json | csv (Default: 'csv')
     -h,  --help         Show this help message and exit.
 """
 
